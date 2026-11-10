@@ -1,0 +1,9 @@
+name = "uproot-proofs"
+defaultTargets = ["UprootProofs"]
+
+[[lean_lib]]
+name = "UprootProofs"
+
+[[lean_exe]]
+name = "room-cases"
+root = "RoomCases"
