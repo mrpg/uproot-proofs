@@ -7,3 +7,7 @@ name = "UprootProofs"
 [[lean_exe]]
 name = "room-cases"
 root = "RoomCases"
+
+[[lean_exe]]
+name = "page-cases"
+root = "PageCases"
