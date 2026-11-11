@@ -232,8 +232,10 @@ inductive Step : World → World → Prop
   | updateRoom (w r cur ρ) : w.rooms r = some cur → cur.sname = none →
       (∀ s, ρ.sname = some s → available w s r) →
       Step w (((w.setRoom r (some ρ)).linkOpt ρ.sname r).sync r)
-  /-- `room_service.disassociate(r, s)`, which raises unless `s` is the room's
-  own session (callers, e.g. a stale admin page, may pass an outdated `s`). -/
+  /-- `room_service.disassociate(r, s)`, which raises if `s` is `None` or is not
+  the room's own session (callers, e.g. a stale admin page, may pass an outdated
+  `s`). Here `s : SName` is a non-null string: Python's `None` is not the session
+  name `"None"`, and an empty room cannot be disassociated. -/
   | disassociate (w r ρ s) : w.rooms r = some ρ → ρ.sname = some s →
       Step w (((w.setRoom r (some { ρ with sname := none })).link s none).sync r)
   /-- `room_service.close_room` after (optional) disassociation -/
