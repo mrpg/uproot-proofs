@@ -2,8 +2,8 @@
 
 A model of uproot's rooms: player admission, the release of waiting players,
 the association between rooms and sessions, and server restarts. The model
-tracks uproot at HEAD; uproot's opt-in `tests/test_rooms_model.py` (below)
-checks that the two agree.
+specifies the intended behavior; uproot's opt-in `tests/test_rooms_model.py`
+(below) checks that the implementation agrees.
 
 | File | Contents |
 |---|---|
@@ -15,15 +15,24 @@ checks that the two agree.
 
 In every reachable state of the room state machine (`Reachable`):
 
-* `released_iff_ready`: players waiting in a room are released exactly when the
+* `ready_event_iff_ready`: the readiness event flag is set exactly when the
   room is ready, i.e. open and associated with a session or a loaded config
   (`step_events` covers every step, including the two that skip `rooms.sync`,
   and server restarts, which may load different configs);
 * `step_assoc`, `session_one_room`: `room["sname"]` and `session.room` are
   mutually inverse and refer to existing sessions, so a session belongs to at
   most one room;
-* `deleted_not_released`, `open_releases`: deleted rooms hold no released
-  waiters; opening a room with a session or a loaded config releases them.
+* `deleted_event_clear`, `open_sets_event`: deletion clears the readiness flag;
+  opening a room with a session or a loaded config sets it.
+
+These are state invariants about the signal, not scheduler liveness proofs.
+An awakened waiter can resume after a room closes; admission rechecks
+readiness. Deletion is terminal for that room lifetime: existing subscriptions
+complete with `RoomDeleted`, and participant sockets close. Recreating the same
+name starts a fresh lifetime. This notification is separate from readiness,
+so deletion never falsely admits participants. The terminal notification and
+lifetime separation are checked by `tests/test_rooms.py`; individual waiters
+and their scheduling are not represented in `World`.
 
 For admission (`server3.roommain`):
 
@@ -55,7 +64,7 @@ that the model describes uproot:
 ```sh
 lake exe room-cases > room-cases.jsonl
 cd path/to/uproot
-UPROOT_MODEL_TESTS=1 UPROOT_FORMAL_CASES=path/to/room-cases.jsonl \
+UPROOT_DATABASE=sqlite3 UPROOT_SQLITE3=:memory: UPROOT_MODEL_TESTS=1 UPROOT_FORMAL_CASES=path/to/room-cases.jsonl \
   uv run pytest tests/test_rooms_model.py
 ```
 

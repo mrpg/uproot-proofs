@@ -276,7 +276,8 @@ inductive Step : World → World → Prop
 
 /-! ## Invariants -/
 
-/-- Waiting players are released exactly when the room is ready. -/
+/-- The readiness event flag mirrors the stored room's readiness. This is a
+state invariant, not a claim about when an awakened waiter is scheduled. -/
 def EventsOK (w : World) : Prop := ∀ r, w.event r = (w.rooms r).any (·.ready w.configs)
 
 /-- `room.sname` and `session.room` are mutually inverse, and refer to existing sessions. -/
@@ -421,7 +422,7 @@ theorem events_sync {w : World} (X : World) (r : RoomName) (he : EventsOK w)
   · subst h; simp [World.sync]
   · simp [World.sync, h, hev, hcf, hro r' h, he r']
 
-/-- Theorem 1: after every step, waiting players are released iff the room is ready —
+/-- Theorem 1: after every step, the event flag is set iff the room is ready —
 including the two steps that skip `sync` (`setCapacity`, `joinCreates`). -/
 theorem step_events {w w'} (he : EventsOK w) (st : Step w w') : EventsOK w' := by
   cases st with
@@ -524,19 +525,20 @@ theorem session_one_room {w} (h : Reachable w) {r₁ r₂ ρ₁ ρ₂ s}
   have ⟨_, ha, _⟩ := reachable_inv h
   have := (ha r₁ ρ₁ s h₁ e₁).1; have := (ha r₂ ρ₂ s h₂ e₂).1; simp_all
 
-/-- Waiters in room `r` are released in every reachable state iff `r` is ready. -/
-theorem released_iff_ready {w} (h : Reachable w) (r : RoomName) :
+/-- In every reachable state, the readiness event is set iff `r` is ready. -/
+theorem ready_event_iff_ready {w} (h : Reachable w) (r : RoomName) :
     w.event r = true ↔ ∃ ρ, w.rooms r = some ρ ∧ ρ.ready w.configs = true := by
   rw [(reachable_inv h).1 r]; cases w.rooms r <;> simp
 
-/-- A successful `set_room_open(r, True)` always releases waiters in `r`. -/
-theorem open_releases {w : World} {r : RoomName} {ρ : Room}
+/-- A successful `set_room_open(r, True)` sets the readiness event. -/
+theorem open_sets_event {w : World} {r : RoomName} {ρ : Room}
     (hg : ρ.sname.isSome ∨ ρ.config.any w.configs) :
     ((w.setRoom r (some { ρ with isOpen := true })).sync r).event r = true := by
   cases hg <;> simp_all [World.sync, Room.ready]
 
-/-- Deleted rooms never hold waiters. -/
-theorem deleted_not_released {w r} (h : Reachable w) (hn : w.rooms r = none) :
+/-- Deletion clears readiness. The separate terminal notification of existing
+waiters is implemented by `RoomEvent.delete` and tested in `test_rooms.py`. -/
+theorem deleted_event_clear {w r} (h : Reachable w) (hn : w.rooms r = none) :
     w.event r = false := by
   rw [(reachable_inv h).1 r, hn]; rfl
 

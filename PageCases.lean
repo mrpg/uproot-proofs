@@ -11,12 +11,20 @@ does (the events it records and the player afterwards). uproot's opt-in
 `tests/test_pages_model.py` replays each case through `server1.show_page` and
 compares (see `docs/pages.md`).
 
-Pages have no app data (`σ = Unit`), and their hooks return fixed results.
+App data track saved values; hooks return fixed results.
 Every hook that a page defines records its call, so that the test sees the
 same events as the model.
 -/
 
 open Pages
+
+abbrev Values := String → Option Int
+
+def initialValues : Values
+  | "a" => some 2
+  | "s" => some 3
+  | "untouched" => some 11
+  | _ => none
 
 /-- A page of a case. -/
 structure Pg where
@@ -38,19 +46,19 @@ structure Case where
   pages : List Pg
   /-- `End.html` -/
   last : Pg
-  state : St Unit
+  state : St Values
   now : Nat
-  req : Req Unit
+  req : Req (Option Int)
 
 def Case.pg (c : Case) (p : Int) : Pg :=
   if p = c.pages.length then c.last
   else if 0 ≤ p ∧ p < c.pages.length then c.pages.getD p.toNat {}
   else {}
 
-def Case.app (c : Case) : App Unit Unit where
+def Case.app (c : Case) : App Values (Option Int) where
   n := c.pages.length
   defines p h := ((c.pg p).hooks.lookup h).isSome
-  run p h _ _ := ((((c.pg p).hooks.lookup h).getD true), (),
+  run p h _ a := ((((c.pg p).hooks.lookup h).getD true), a,
     match (c.pg p).mover with
     | some (g, t) => if g = h then some t else none
     | none => none)
@@ -59,10 +67,17 @@ def Case.app (c : Case) : App Unit Unit where
   valid p _ _ := ((c.pg p).form.map (·.1)).getD true
   manual p _ _ := ((c.pg p).form.map (·.2)).getD false
   ordinary _ _ _ := ["a"]
-  save _ _ a := a
+  save _ f a := fun field => if field = "a" then f else a field
   timeout p _ := (c.pg p).timeout
   start a := a
   tolerance := 1
+
+/-- The case interpreter satisfies the value and preservation contract used
+by `accept_values`; the Python test compares these values, including clears. -/
+theorem Case.save_law (c : Case) :
+    c.app.SaveLaw (fun a field => a field) (fun _ f _ _ => f) := by
+  intro k f a field
+  simp [Case.app]
 
 /-! ## JSON -/
 
@@ -100,18 +115,21 @@ def jEv : Ev → String
 /-- Positions `-1` to `n`. -/
 def positions (n : Nat) : List Int := (List.range (n + 2)).map fun (i : Nat) => (i : Int) - 1
 
-def jSt (n : Nat) (s : St Unit) : String :=
+def jSt (n : Nat) (s : St Values) : String :=
   "{\"pos\":" ++ toString s.pos ++ ",\"started\":" ++ toString s.started
     ++ ",\"ran\":" ++ jList (fun (p, h) => "[" ++ toString p ++ "," ++ jStr h.name ++ "]") s.ran
     ++ ",\"deadlines\":" ++ jList (fun (p, t) => "[" ++ toString p ++ "," ++ toString t ++ "]")
-      ((positions n).filterMap fun p => (s.deadline p).map fun t => (p, t)) ++ "}"
+      ((positions n).filterMap fun p => (s.deadline p).map fun t => (p, t))
+    ++ ",\"values\":{\"a\":" ++ jOpt toString (s.app "a")
+    ++ ",\"s\":" ++ jOpt toString (s.app "s")
+    ++ ",\"untouched\":" ++ jOpt toString (s.app "untouched") ++ "}}"
 
-def jReq : Req Unit → String
+def jReq : Req (Option Int) → String
   | .get => "{\"method\":\"GET\"}"
-  | .post src back token _ =>
+  | .post src back token value =>
     "{\"method\":\"POST\",\"from\":" ++
       jOpt (fun p => jStr ((if back then "back-" else "") ++ toString p)) src ++
-      ",\"token\":" ++ toString token ++ "}"
+      ",\"token\":" ++ toString token ++ ",\"value\":" ++ jOpt toString value ++ "}"
 
 def Case.json (c : Case) : String :=
   let s' := c.app.step c.now c.req c.state
@@ -150,8 +168,8 @@ def markers (pages : List Pg) (k : Int) (entered : Bool) : List (Int × Hook) :=
     let hs := if (i : Int) < k then all else if (i : Int) = k then entering else []
     (hs.filter fun h => (pg.hooks.lookup h).isSome).map ((i : Int), ·)
 
-def player (pages : List Pg) (k : Int) (entered : Bool) (dl : Option Nat) : St Unit :=
-  ⟨k, decide (0 ≤ k), markers pages k entered, fun p => if p = k then dl else none, [], (), -1⟩
+def player (pages : List Pg) (k : Int) (entered : Bool) (dl : Option Nat) : St Values :=
+  ⟨k, decide (0 ≤ k), markers pages k entered, fun p => if p = k then dl else none, [], initialValues, -1⟩
 
 /-- A hook that the page does not define, or one that returns `true` or `false`. -/
 def results : List (Option Bool) := [none, some true, some false]
@@ -183,24 +201,31 @@ def coreCases : List Case := orders.flatMap fun pages =>
     let mk pg dl req : Case := ⟨set pages k pg, endPage, player (set pages k pg) k entered dl, now, req⟩
     let loads := deadlines.flatMap fun dl => results.flatMap fun mp =>
       let pg := (if dl.isSome then { base with timeout := some 30 } else base).opt .mayProceed mp
-      [ mk pg dl .get, mk pg dl (.post (some (k + 1)) false true ()),
-        mk pg dl (.post (some k) false false ()), mk pg dl (.post none false true ()) ]
+      [ mk pg dl .get, mk pg dl (.post (some (k + 1)) false true (some 7)),
+        mk pg dl (.post (some k) false false (some 7)), mk pg dl (.post none false true (some 7)) ]
     let nexts := deadlines.flatMap fun dl => results.flatMap fun mp =>
       (forms ((if dl.isSome then { base with timeout := some 30 } else base).opt .mayProceed mp)).map
-        fun pg => mk pg dl (.post (some k) false true ())
+        fun pg => mk pg dl (.post (some k) false true (some 7))
     let backs := deadlines.flatMap fun dl => results.flatMap fun ab =>
       [none, some false].flatMap fun mp =>
         ((forms (((if dl.isSome then { base with timeout := some 30 } else base).opt .allowBack ab).opt
-          .mayProceed mp)).take 3).map fun pg => mk pg dl (.post (some k) true true ())
+          .mayProceed mp)).take 3).map fun pg => mk pg dl (.post (some k) true true (some 7))
     loads ++ nexts ++ backs
 
 /-- Requests at `Initialize.html` and `End.html`. -/
 def edgeCases : List Case := orders.flatMap fun pages =>
   let n : Int := pages.length
   let mk k req : Case := ⟨pages, endPage, player pages k (decide (0 ≤ k)) none, now, req⟩
-  [ mk (-1) .get, mk (-1) (.post (some (-1)) false true ()), mk (-1) (.post (some (-1)) true true ()),
-    mk (-1) (.post (some (-1)) false false ()),
-    mk n .get, mk n (.post (some n) false true ()), mk n (.post (some n) true true ()) ]
+  [ mk (-1) .get, mk (-1) (.post (some (-1)) false true (some 7)), mk (-1) (.post (some (-1)) true true (some 7)),
+    mk (-1) (.post (some (-1)) false false (some 7)),
+    mk n .get, mk n (.post (some n) false true (some 7)), mk n (.post (some n) true true (some 7)) ]
+
+/-- Clearing an optional field saves `none`, preserving manual and unrelated
+fields, both when staying and when leaving (also on a timeout). -/
+def clearCases : List Case := [false, true].flatMap fun stealth =>
+  results.flatMap fun mp => deadlines.map fun dl =>
+    let pg := ({ hooks := [(.beforeFormSave, true)], form := some (true, stealth) } : Pg).opt .mayProceed mp
+    ⟨[pg], endPage, player [pg] 0 true dl, now, .post (some 0) false true none⟩
 
 def allHooks : List Hook :=
   [.early, .beforeAlwaysOnce, .show, .beforeOnce, .afterOnce, .afterAlwaysOnce, .timeoutReached,
@@ -231,8 +256,8 @@ def moveCases : List Case :=
             let pg := pages'.getD i {}
             let pages'' := set pages' i { pg.with h (moverResult pg h) with mover := some (h, t) }
             let mk req : Case := ⟨pages'', endPage, player pages'' k true dl, now, req⟩
-            [mk .get, mk (.post (some k) false true ()), mk (.post (some k) true true ())]
+            [mk .get, mk (.post (some k) false true (some 7)), mk (.post (some k) true true (some 7))]
 
 def main : IO Unit := do
-  for c in coreCases ++ edgeCases ++ moveCases do
+  for c in coreCases ++ edgeCases ++ clearCases ++ moveCases do
     IO.println c.json

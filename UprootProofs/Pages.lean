@@ -15,8 +15,8 @@ A player is at a *position* (`show_page`): `-1` (`Initialize.html`), a page of
 the page order (`0, …, n - 1`) or the end (`n`, `End.html`). A request ends by
 displaying the page at the player's position.
 
-1. **Entering.** A position is entered whenever navigation reaches it:
-   `early`, then `before_always_once`. Then `show()` decides. A page that is not
+1. **Entering.** Entry runs `early`, then `before_always_once`. For forward
+   navigation and loading, `show()` then decides. A page that is not
    shown is *skipped* (`after_always_once`, then the next position is entered);
    a shown page is *displayed* (`before_once`, then the page). `End.html` is
    always shown.
@@ -32,7 +32,8 @@ displaying the page at the player's position.
 4. **Leaving.** An accepted submission leaves the page if `may_proceed` allows
    it: `after_once`, `after_always_once`, then the next position is entered.
    Otherwise the page is displayed again, with the submitted values, and with
-   errors if the submission was rejected. Errors are shown on no other page.
+   errors if the submission was rejected, without rechecking `show()`.
+   Errors are shown on no other page.
 5. **Timeouts.** After a page's deadline, every request is a timed-out
    submission: `timeout_reached` runs, the form is saved if it is accepted, and
    the page is left, whatever `may_proceed` says. Up to `TIMEOUT_TOLERANCE`
@@ -40,7 +41,8 @@ displaying the page at the player's position.
 6. **Back.** Back leads to the nearest earlier page that is shown, without
    crossing the start of an app, a round or an iteration of `Repeat`; if there
    is none, or `allow_back` forbids it, the player stays. The page that the
-   player goes back to is entered and displayed (1, 2). Back saves nothing and
+   player goes back to is entered and displayed (2). Selection asks `show()`
+   before entry; entry does not ask it again. Back saves nothing and
    asks no `may_proceed`. After the deadline, Back is a timed-out submission (5).
 7. **Moves.** A hook may move the player forward (`move_to_page`,
    `move_to_end`). The hooks of the current step finish (entering, `show()`,
@@ -48,8 +50,10 @@ displaying the page at the player's position.
    enters the target.
 
 Hooks are app code: they may read and write any app data (`σ`), and their
-results may depend on it. A request is one handler run, atomic for the
-player: `show_page_wrapper` holds the player's page lock. Hooks that raise are
+results may depend on it. A request is one handler run, assumed atomic for the
+player. The page lock serializes page requests, but does not exclude admin or
+other external interventions during an async hook; those interleavings are
+outside this model. Hooks that raise are
 not modelled. Nor are changes of the page order (`Repeat`, `Between`), which
 leave the positions up to the current one as they are.
 -/
@@ -88,9 +92,10 @@ inductive Ev
   | error
   deriving DecidableEq, Repr
 
-/-- A project, as far as one player's pages are concerned. `n` is the length of
-the page order. `σ` is the data that app code reads and writes, `F` submitted
-form data. -/
+/-- A project, as far as one player's pages are concerned, specialized to the
+actual HTTP request: `run` may close over that request (notably for `early`).
+`n` is the length of the page order. `σ` is the data that app code reads and
+writes, `F` submitted form data. -/
 structure App (σ F : Type) where
   n : Nat
   /-- The page at `p` defines hook `h` (`hasattr`). -/
@@ -138,7 +143,9 @@ structure St (σ : Type) where
 
 def St.init {σ} (a : σ) : St σ := ⟨-1, false, [], fun _ => none, [], a, -1⟩
 
-/-- A request. `post src back token form`: `_uproot_from` names position `src`
+/-- The handler's form-control input; the actual HTTP request is captured by
+`App`. `get` selects loading, retaining that same hook context.
+`post src back token form`: `_uproot_from` names position `src`
 (`none` if it is missing or malformed), prefixed by `back-` for Back; `token`:
 `_uproot_csrf` is valid. -/
 inductive Req (F : Type)
@@ -320,6 +327,9 @@ def App.arm (now : Nat) (s : St σ) : St σ :=
 /-- One request at time `now`. -/
 def App.step (now : Nat) (r : Req F) (s : St σ) : St σ := A.arm now (A.respond now r s)
 
+/-- The loading path with this actual request's hook context. -/
+def App.loading (now : Nat) (s : St σ) : St σ := A.step now .get s
+
 end Handler
 
 /-! ## Facts about the parts of the handler
@@ -420,6 +430,18 @@ theorem once_mem (h p again s) (hd : A.defines p h) : (p, h) ∈ (A.once h p aga
   · simp only [call_ran]; split <;> simp_all
   · next hn => simp_all
 
+/-- A defined, unmarked hook actually runs on its first occasion. -/
+theorem once_first (h p s) (hd : A.defines p h = true) (fresh : (p, h) ∉ s.ran) :
+    (A.once h p false s).log = s.log ++ [.call p h (A.run p h default s.app).1] := by
+  simp [App.once, hd, fresh, App.call]
+
+theorem once_trace (h p again s) :
+    ∃ u, (A.once h p again s).log = s.log ++ u ∧
+      (u = [] ∨ ∃ b, u = [.call p h b]) := by
+  rcases once_log A h p again s with e | ⟨b, e⟩
+  · exact ⟨[], by simpa using e, .inl rfl⟩
+  · exact ⟨_, e, .inr ⟨b, rfl⟩⟩
+
 @[simp] theorem runs_nil (p h) : runs p h [] = 0 := rfl
 theorem runs_append (p h l₁ l₂) : runs p h (l₁ ++ l₂) = runs p h l₁ + runs p h l₂ :=
   List.countP_append
@@ -513,6 +535,16 @@ theorem enter_grows (c : Int) (again : Bool) (s : St σ) :
       (fun e h => h) (fun e h => h))
     (once_grows A _ _ _ _)
     (fun e ⟨b, h⟩ => ⟨_, b, h, rfl, by decide⟩) (fun e ⟨b, h⟩ => ⟨_, b, h, rfl, by decide⟩)
+
+/-- Entry records only `early`, then `before_always_once`, in that order;
+each contributes either no event or one call. -/
+theorem enter_order (c : Int) (again : Bool) (s : St σ) :
+    ∃ e b, (A.once .beforeAlwaysOnce c false (A.once .early c again { s with pos := c })).log =
+      s.log ++ e ++ b ∧ (e = [] ∨ ∃ v, e = [.call c .early v]) ∧
+      (b = [] ∨ ∃ v, b = [.call c .beforeAlwaysOnce v]) := by
+  obtain ⟨e, he, pe⟩ := once_trace A .early c again { s with pos := c }
+  obtain ⟨b, hb, pb⟩ := once_trace A .beforeAlwaysOnce c false (A.once .early c again { s with pos := c })
+  exact ⟨e, b, by simp [hb, he], pe, pb⟩
 
 /-- The hooks that run before a page at `p` is displayed have run there. -/
 def App.Entered (s : St σ) (p : Int) : Prop :=
@@ -1068,6 +1100,32 @@ theorem accept_spec (k : Int) (f : F) (s : St σ) :
     · exact ⟨.inl rfl, [], by simp, by simp, by simp⟩
   · next h => exact ⟨.inl rfl, [], by simp, by simp, by simp [h]⟩
 
+/-- The contract of the save primitive: write the validated ordinary values,
+and preserve every other field. `value` includes parsing and cleared optional
+fields; it is evaluated in the state immediately before the save, after hooks.
+This is an explicit assumption on an implementation of `App.save`. -/
+def App.SaveLaw {V : Type} (read : σ → String → V)
+    (value : Int → F → σ → String → V) : Prop :=
+  ∀ k f a field, read (A.save k f a) field =
+    if field ∈ A.ordinary k f a then value k f a field else read a field
+
+/-- Given the primitive's contract, accepting a form writes exactly its
+ordinary values. Hooks may change data before saving; rejection does not
+promise to undo those app effects (`accept_spec` proves no automatic save). -/
+theorem accept_values {V : Type} (read : σ → String → V)
+    (value : Int → F → σ → String → V) (law : A.SaveLaw read value)
+    (k : Int) (f : F) (s : St σ) (hf : A.hasForm k = true)
+    (ha : (A.accept k f s).1 = true) :
+    ∃ a, (A.accept k f s).2.app = A.save k f a ∧
+      ∀ field, read (A.accept k f s).2.app field =
+        if field ∈ A.ordinary k f a then value k f a field else read a field := by
+  unfold App.accept at ha ⊢
+  simp only [hf, ↓reduceIte] at ha ⊢
+  split <;> simp_all
+  split <;> simp_all
+  split <;> simp_all
+  exact ⟨_, rfl, law _ _ _⟩
+
 theorem fires_spec (now t : Nat) (k : Int) (s : St σ) :
     A.Fwd s (A.fires now t k s).2 ∧ Grows (Calls k (· = .mayProceed)) s (A.fires now t k s).2 := by
   unfold App.fires; split
@@ -1116,19 +1174,20 @@ omit [Inhabited F] in
 theorem entered_arm {now s p} : A.Entered (A.arm now s) p ↔ A.Entered s p := by
   simp [App.Entered]
 
-/-- (3) A request that does not carry the form of the player's position with a
-valid token is handled exactly as loading the page. -/
-theorem foreign_is_get (now : Nat) (r : Req F) (s : St σ) (h : r.submission s.pos = none) :
-    A.step now r s = A.step now .get s := by
+/-- (3) A foreign form follows the loading path with the same actual request
+available to hooks. This does not equate a real POST's app effects with those
+of a real GET: their request-specialized `App`s can differ. -/
+theorem foreign_is_load (now : Nat) (r : Req F) (s : St σ) (h : r.submission s.pos = none) :
+    A.step now r s = A.loading now s := by
   have hg : (Req.get : Req F).submission s.pos = none := rfl
-  simp only [App.step, App.respond, h, hg]
+  simp only [App.loading, App.step, App.respond, h, hg]
 
 /-- (3) Submitting a form again once it has taken the player elsewhere (e.g.,
 a double click on Next) is handled as loading the page. -/
-theorem resubmit_is_get (now now' : Nat) (r : Req F) (s : St σ) (b : Bool) (f : F)
+theorem resubmit_is_load (B : App σ F) (now now' : Nat) (r : Req F) (s : St σ) (b : Bool) (f : F)
     (h : r.submission s.pos = some (b, f)) (hl : (A.step now r s).pos ≠ s.pos) :
-    A.step now' r (A.step now r s) = A.step now' .get (A.step now r s) := by
-  apply foreign_is_get
+    B.step now' r (A.step now r s) = B.loading now' (A.step now r s) := by
+  apply foreign_is_load
   match r, h with
   | .post (some p) back true form, h =>
     have hp : p = s.pos := by
@@ -2000,7 +2059,9 @@ of other players move them (`advance_by_one`, `revert_by_one`, `put_to_end`,
 markers that `move_to_page` sets up), and change app data. -/
 inductive App.Reach : St σ → Prop
   | init (a : σ) : App.Reach (St.init a)
-  | step {s} (now : Nat) (r : Req F) : App.Reach s → App.Reach (A.step now r s)
+  /-- Each request may have a different request-specialized hook interpreter. -/
+  | step {s} (run : Int → Hook → F → σ → Bool × σ × Option Int) (now : Nat) (r : Req F) :
+      App.Reach s → App.Reach (({ A with run := run } : App σ F).step now r s)
   | start {s} : App.Reach s → App.Reach { s with started := true }
   | move {s} (t : Int) : App.Reach s → 0 ≤ t → t ≤ A.n → (0 ≤ s.pos ∨ t = A.n) →
       App.Reach { s with pos := t }
@@ -2011,8 +2072,8 @@ inductive App.Reach : St σ → Prop
 theorem reach_pos {s : St σ} (h : A.Reach s) : -1 ≤ s.pos ∧ s.pos ≤ A.n := by
   induction h with
   | init => simp [St.init]
-  | step now r _ ih =>
-    obtain ⟨_, _, _, _, h1, h2, _⟩ := step_display A now r _ ih.1 ih.2
+  | step run now r _ ih =>
+    obtain ⟨_, _, _, _, h1, h2, _⟩ := step_display { A with run := run } now r _ ih.1 ih.2
     exact ⟨h1, h2⟩
   | start _ ih => exact ih
   | move t _ h0 hn _ => exact ⟨show -1 ≤ t by omega, hn⟩
@@ -2023,9 +2084,9 @@ theorem reach_pos {s : St σ} (h : A.Reach s) : -1 ≤ s.pos ∧ s.pos ≤ A.n :
 theorem reach_no_error {s : St σ} (h : A.Reach s) : Ev.error ∉ s.log := by
   induction h with
   | init => simp [St.init]
-  | step now r hs ih =>
+  | step run now r hs ih =>
     have hp := reach_pos A hs
-    obtain ⟨u, sh, e, pu, -⟩ := step_display A now r _ hp.1 hp.2
+    obtain ⟨u, sh, e, pu, -⟩ := step_display { A with run := run } now r _ hp.1 hp.2
     rw [e]; intro he
     simp only [List.mem_append, List.mem_singleton] at he
     rcases he with (he | he) | he
@@ -2045,7 +2106,7 @@ theorem reach_once {s : St σ} (h : A.Reach s) (p : Int) (g : Hook) (hg : g.once
   have ok : OnceOK s := by
     induction h with
     | init => intro q g _; simp [St.init]
-    | step now r _ ih => exact (onceOK A).step now r _ ih
+    | step run now r _ ih => exact (onceOK { A with run := run }).step now r _ ih
     | start _ ih => exact ih
     | move _ _ _ _ _ ih => exact ih
     | once h p _ ih => exact once_ok A h p false _ (fun _ => rfl) ih
@@ -2063,13 +2124,13 @@ theorem reach_entered {s : St σ} (h : A.Reach s) (p : Int) (sh : Shown)
     (hd : Ev.display p sh ∈ s.log) (h0 : 0 ≤ p) : A.Entered s p := by
   induction h with
   | init => simp [St.init] at hd
-  | step now r hs ih =>
+  | step run now r hs ih =>
     have hp := reach_pos A hs
-    obtain ⟨u, sh', e, pu, -, -, hent⟩ := step_display A now r _ hp.1 hp.2
+    obtain ⟨u, sh', e, pu, -, -, hent⟩ := step_display { A with run := run } now r _ hp.1 hp.2
     rw [e] at hd
     simp only [List.mem_append, List.mem_singleton] at hd
     rcases hd with (hd | hd) | hd
-    · exact Entered.mono A ((ranGrows A).step now r _) (ih hd)
+    · exact Entered.mono A ((ranGrows { A with run := run }).step now r _) (ih hd)
     · rcases pu _ hd with ⟨_, _, _, h⟩ | h | ⟨_, _, h⟩ <;> cases h
     · cases hd; exact hent h0
   | start _ ih => exact ih hd

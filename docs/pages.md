@@ -18,8 +18,8 @@ A player is at a *position* (`show_page`): `-1` (`Initialize.html`), a page of
 the page order (`0, …, n - 1`) or the end (`n`, `End.html`). A request ends by
 displaying the page at the player's position.
 
-1. **Entering.** A position is entered whenever navigation reaches it:
-   `early`, then `before_always_once`. Then `show()` decides. A page that is not
+1. **Entering.** Entry runs `early`, then `before_always_once`. For forward
+   navigation and loading, `show()` then decides. A page that is not
    shown is *skipped* (`after_always_once`, then the next position is entered);
    a shown page is *displayed* (`before_once`, then the page). `End.html` is
    always shown.
@@ -35,15 +35,18 @@ displaying the page at the player's position.
 4. **Leaving.** An accepted submission leaves the page if `may_proceed` allows
    it: `after_once`, `after_always_once`, then the next position is entered.
    Otherwise the page is displayed again, with the submitted values, and with
-   errors if the submission was rejected. Errors are shown on no other page.
+   errors if the submission was rejected, without rechecking `show()`.
+   Errors are shown on no other page.
 5. **Timeouts.** After a page's deadline, every request is a timed-out
    submission: `timeout_reached` runs, the form is saved if it is accepted, and
    the page is left, whatever `may_proceed` says. Up to `TIMEOUT_TOLERANCE`
    seconds before the deadline, the same holds if `may_proceed` allows it.
 6. **Back.** Back leads to the nearest earlier page that is shown, without
    crossing the start of an app, a round or an iteration of `Repeat`; if there
-   is none, or `allow_back` forbids it, the player stays. The page that the
-   player goes back to is entered and displayed (1, 2). Back saves nothing and
+   is none, or `allow_back` forbids it, the player stays. Selection asks
+   `show()` before entry; the selected page is then entered and displayed,
+   without asking `show()` again even if entry changes its visibility (2).
+   Back saves nothing and
    asks no `may_proceed`. After the deadline, Back is a timed-out submission (5).
 7. **Moves.** A hook may move the player forward (`move_to_page`,
    `move_to_end`). The hooks of the current step finish (entering, `show()`,
@@ -68,13 +71,21 @@ For every request (`App.step`):
 * `step_display`: it ends by displaying the page at the player's position,
   which is entered; before that, it only runs hooks, starts the player or saves
   a form (1);
-* `foreign_is_get`, `resubmit_is_get`: a request that does not carry the form
-  of the player's position with a valid token is handled exactly as loading the
-  page; so is submitting a form again once it has taken the player elsewhere
-  (3);
+* `enter_order`, `once_first`: entry calls `early` before
+  `before_always_once`; a defined once-hook really runs at its first occasion,
+  complementing the at-most-once invariant (1, 2);
+* `foreign_is_load`, `resubmit_is_load`: a request that does not carry the form
+  of the player's position with a valid token follows the loading path; so does
+  resubmitting a form after moving elsewhere (3). The actual HTTP request is
+  retained for hooks: `early` may distinguish a POST from a GET;
 * `step_saves`, `accept_spec`: at most one form is saved, the submitted form of
   the player's position, exactly if it is accepted; Back saves only as a
   timed-out submission (3, 6);
+* `accept_values`: given the explicit `App.SaveLaw` contract of the save
+  primitive, an accepted form writes its validated ordinary values and
+  preserves all other fields at the save. Cleared optional fields have value
+  `None`. Hooks may change data before this save; rejection does not roll back
+  app code (3);
 * `step_errors`: submitted values and errors are displayed only if the player
   stays at the position whose form they submitted, before its deadline (4);
 * `step_timeout`: after the deadline, the request leaves the page:
@@ -119,13 +130,23 @@ principle:
 * A form that is not the current page's, e.g., one submitted just after an
   admin advanced the player, is handled as loading the page: before, uproot
   displayed the current page without entering it, even if it was hidden (3).
+* A `move_to_end` inside a request finishes the current phase before end
+  cleanup; an external move still runs cleanup immediately, including for a
+  dropout who never returns (7).
+
+The executable definitions are the operational contract, and the theorems
+establish its stated consequences. `App` is specialized to the actual HTTP
+request; `Req` describes form routing, not a replacement HTTP request.
+`App.Reach.step` permits a different hook interpreter for each request.
+`App.SaveLaw` is an explicit implementation obligation, not a consequence of
+counting save events.
 
 ## Testing the specification against uproot
 
 The theorems are about the specification. uproot's opt-in test
 `tests/test_pages_model.py` (skipped unless `UPROOT_MODEL_TESTS` is set) checks
 that uproot implements it: `test_page_cases` replays the cases from
-`lake exe page-cases` (81,736 requests: page orders of shown, hidden and
+`lake exe page-cases` (81,760 requests: page orders of shown, hidden and
 barrier pages and pages without hooks, players at every position with and
 without the markers of having got there, `GET`, stale and foreign forms, forms
 that validate or not, `validate` and `handle_stealth_fields` rejecting or not,
@@ -133,21 +154,33 @@ that validate or not, `validate` and `handle_stealth_fields` rejecting or not,
 tolerance window or passed, and hooks that move the player) through
 `server1.show_page` and compares, in order, the hook calls, the start, the
 saves and the page displayed, and then the player's position, markers and
-deadlines.
+deadlines. It uses the real `move_to_end`, and compares saved values, cleared
+optional fields, and preservation of manual and unrelated fields. The case
+interpreter satisfies `App.SaveLaw` (`Case.save_law`).
 
 ```sh
 lake exe page-cases > page-cases.jsonl
 cd path/to/uproot
-UPROOT_MODEL_TESTS=1 UPROOT_PAGE_CASES=path/to/page-cases.jsonl \
+UPROOT_DATABASE=sqlite3 UPROOT_SQLITE3=:memory: UPROOT_MODEL_TESTS=1 UPROOT_PAGE_CASES=path/to/page-cases.jsonl \
   uv run pytest tests/test_pages_model.py
 ```
 
 ## Scope
 
-A request is one run of the handler, atomic for the player:
-`show_page_wrapper` holds the player's page lock. Hooks are app code: they may
-read and write any app data, their results may depend on it, and they may move
-the player forward. Not modelled: hooks that raise; hooks that move the player
+A request is one run of the handler, **assumed atomic for the player** for
+simplicity and clarity. `show_page_wrapper` holds the player's page lock,
+which serializes page requests. It does not exclude an admin, a live method,
+a background task or another player's app code intervening while an async
+hook waits. Such interleavings are outside the model. `App.Reach` models
+external interventions between requests; these proofs do not establish the
+behavior of concurrent admin interventions.
+
+Hooks may read and write app data, depend on the actual HTTP request and move
+the player forward. The model abstracts field validation and saving: value
+correctness is conditional on `App.SaveLaw`, with concrete values checked by
+the differential tests. “All at once” describes the automatic form save in a
+successful handler, not crash recovery or rollback of hook effects.
+Not modelled: hooks that raise; hooks that move the player
 backward (`move_to_page` raises for pages that are not ahead); changes of the
 page order (`Repeat`, `Between`), which leave the positions up to the current
 one as they are; rendering, and what live methods do between requests.
