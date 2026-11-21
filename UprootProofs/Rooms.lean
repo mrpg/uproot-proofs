@@ -18,7 +18,11 @@ Each `Step` is one request handler, taken as atomic: uproot serves from a single
 process and event-loop thread (`cli.py`), no room-mutating handler awaits between
 its reads and its writes, and every handler that can fail does so before its
 first write (in-place changes are flushed only when an `Admin()` context exits
-cleanly). A process crash in the middle of a handler is not modelled.
+cleanly). The one exception is `roommain`: it may first auto-create and link a
+session (`joinCreates`) and only then fail while admitting the player, e.g.
+when an app's `entry_data` raises or returns unencodable data. Admission
+changes no modelled state, so such a request ends exactly in the state after
+`joinCreates`. A process crash in the middle of a handler is not modelled.
 -/
 
 namespace Rooms
@@ -260,7 +264,8 @@ inductive Step : World → World → Prop
       w.sessions s = false →
       Step w ((((w.newSession s).setRoom r
         (some { ρ with sname := some s, isOpen := true, capacity := c })).link s (some r)).sync r)
-  /-- `roommain` auto-creating a session for a ready room — does NOT call `sync`. -/
+  /-- `roommain` auto-creating a session for a ready room — does NOT call `sync`.
+  This is committed even if the subsequent player admission fails. -/
   | joinCreates (w r ρ s) : w.rooms r = some ρ → ρ.ready w.configs = true → ρ.sname = none →
       w.sessions s = false →
       Step w (((w.newSession s).setRoom r (some { ρ with sname := some s })).link s (some r))
